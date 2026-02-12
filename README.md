@@ -15,7 +15,6 @@ npm run build
 bash```
 npm install-global
 ```
-```
 ## usage
 
 ```bash
