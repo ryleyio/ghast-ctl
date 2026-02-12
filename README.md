@@ -12,7 +12,7 @@ npm run build
 ```
 
 ## install cli command
-bash```
+```bash
 npm install-global
 ```
 ## usage
