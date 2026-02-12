@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLI="node $SCRIPT_DIR/dist/cli.js"
+
+usage() {
+  cat <<EOF
+ghast - Browser/Electron automation with Claude agent support
+
+USAGE:
+  ghast start [options]                    Start browser daemon
+  ghast control --server PORT "command"    Send command to daemon
+  ghast stop --server PORT                 Stop daemon
+  ghast agent [knowledge.md...] "task"     Start browser + Claude agent
+
+START OPTIONS:
+  --stealth       Enable stealth mode
+  --headless      Run browser headless
+  --electronApp   Path to .app bundle
+  --port          Connect to existing CDP port
+
+AGENT MODE:
+  ghast agent [options] [knowledge.md...] "task"
+
+  Options:
+    --stealth     Enable stealth mode
+    --headless    Run browser headless (default: visible)
+
+  Examples:
+    ghast agent "go to example.com and get the title"
+    ghast agent --stealth knowledge/reddit.md "analyze r/wallstreetbets"
+    ghast agent --stealth --headless "scrape hackernews"
+
+  The last argument is always the task. Args ending in .md are knowledge files.
+
+EXAMPLES:
+  # Start browser and get port
+  PORT=\$(ghast start --headless)
+
+  # Send commands
+  ghast control --server \$PORT "navigate https://example.com"
+  ghast control --server \$PORT "screenshot" > shot.png
+
+  # Stop
+  ghast stop --server \$PORT
+
+  # Or use agent mode (starts browser + Claude automatically)
+  ghast agent "go to hackernews and get top 5 stories"
+EOF
+}
+
+cmd_start() {
+  $CLI start "$@"
+}
+
+cmd_control() {
+  $CLI control "$@"
+}
+
+cmd_stop() {
+  $CLI stop "$@"
+}
+
+cmd_agent() {
+  local knowledge_files=()
+  local task=""
+  local stealth=""
+  local headless=""
+
+  # Parse args
+  for arg in "$@"; do
+    if [[ "$arg" == "--stealth" ]]; then
+      stealth="--stealth"
+    elif [[ "$arg" == "--headless" ]]; then
+      headless="--headless"
+    elif [[ "$arg" == *.md ]]; then
+      knowledge_files+=("$arg")
+    else
+      task="$arg"
+    fi
+  done
+
+  if [[ -z "$task" ]]; then
+    echo "Error: No task provided. Usage: ghast agent [--stealth] [--headless] [knowledge.md...] \"task\"" >&2
+    exit 1
+  fi
+
+  # Start browser in background and capture port
+  echo "Starting browser..." >&2
+  local port_file=$(mktemp)
+  $CLI start $stealth $headless > "$port_file" 2>&1 &
+  local browser_pid=$!
+
+  # Wait for port to be written
+  sleep 3
+  local port=$(head -1 "$port_file" 2>/dev/null || echo "")
+  rm -f "$port_file"
+
+  if [[ -z "$port" ]] || ! [[ "$port" =~ ^[0-9]+$ ]]; then
+    echo "Error: Failed to start browser or get port" >&2
+    kill $browser_pid 2>/dev/null || true
+    exit 1
+  fi
+
+  echo "Browser started on port $port (PID: $browser_pid)" >&2
+
+  # Build knowledge file list for system prompt
+  local knowledge_instructions=""
+  if [[ ${#knowledge_files[@]} -gt 0 ]]; then
+    knowledge_instructions="Then read these knowledge files for site-specific navigation hints:
+"
+    for kf in "${knowledge_files[@]}"; do
+      knowledge_instructions+="- $SCRIPT_DIR/$kf
+"
+    done
+  fi
+
+  # Create system prompt
+  local system_prompt="You are a browser automation agent. A browser is already running and ready for commands.
+
+FIRST: Read the documentation at $SCRIPT_DIR/CLAUDE.md to understand available commands.
+$knowledge_instructions
+BROWSER CONTROL:
+- Server port: $port
+- Send commands: ghast control --server $port \"command\"
+- Example: ghast control --server $port \"navigate https://example.com\"
+- Example: ghast control --server $port \"screenshot\" > screenshot.png
+
+IMPORTANT:
+- The browser is already running. Do NOT run 'ghast start'.
+- Execute commands using 'ghast control --server $port \"...\"'
+- When done, ask if user wants to save navigation hints to knowledge/<site>.md
+- If the task fails, try to recover. Check screenshots to see what's on screen.
+
+YOUR TASK: $task
+
+Begin immediately. Do not ask for confirmation - just start executing the task."
+
+  # Trap to cleanup browser on exit
+  trap "echo '' >&2; echo 'Stopping browser...' >&2; $CLI stop --server $port 2>/dev/null || kill $browser_pid 2>/dev/null || true" EXIT
+
+  # Run Claude with the task
+  echo "Starting Claude agent..." >&2
+  echo "---" >&2
+
+  claude --dangerously-skip-permissions -p "$system_prompt"
+}
+
+# Main dispatch
+case "${1:-}" in
+  start)
+    shift
+    cmd_start "$@"
+    ;;
+  control)
+    shift
+    cmd_control "$@"
+    ;;
+  stop)
+    shift
+    cmd_stop "$@"
+    ;;
+  agent)
+    shift
+    cmd_agent "$@"
+    ;;
+  help|--help|-h)
+    usage
+    ;;
+  "")
+    usage
+    exit 1
+    ;;
+  *)
+    echo "Unknown command: $1" >&2
+    echo "Run 'ghast help' for usage" >&2
+    exit 1
+    ;;
+esac
